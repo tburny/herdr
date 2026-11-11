@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.9.1005] - 2026-11-12
+
 Fork test release of the binary Nix flake and the build-before-tag release order. Not a real Herdr release.
 
 ### Changed
