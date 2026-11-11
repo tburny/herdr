@@ -47,7 +47,7 @@ mise use -g herdr
 
 ## 用 Nix 安装
 
-如果你已经在用 Nix,Herdr 提供了一个从源码构建的 flake:
+如果你已经在用 Nix,Herdr 提供了一个为你的系统安装已发布二进制文件的 flake:
 
 ```bash
 nix run github:herdrdev/herdr/v0.x.y
@@ -56,6 +56,12 @@ nix profile install github:herdrdev/herdr/v0.x.y
 ```
 
 把 `v0.x.y` 替换为最新的发布标签。省略标签可以跟踪 `master`,但常规安装建议使用发布标签。
+
+该 flake 支持 x86_64 和 aarch64 上的 Linux 与 macOS。如需用 Nix 从源码构建 Herdr,请改用 nixpkgs 中的软件包:
+
+```bash
+nix run nixpkgs#herdr
+```
 
 flake 还提供一个开发 shell:
 

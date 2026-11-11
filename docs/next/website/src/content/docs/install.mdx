@@ -47,7 +47,7 @@ If mise reports `herdr not found in mise tool registry`, update mise and retry. 
 
 ## Install with Nix
 
-If you already use Nix, Herdr provides a flake that builds Herdr from source:
+If you already use Nix, Herdr provides a flake that installs the released binary for your system:
 
 ```bash
 nix run github:herdrdev/herdr/v0.x.y
@@ -56,6 +56,12 @@ nix profile install github:herdrdev/herdr/v0.x.y
 ```
 
 Replace `v0.x.y` with the latest release tag. You can omit the tag to track `master`, but release tags are recommended for normal installs.
+
+The flake supports Linux and macOS on x86_64 and aarch64. To build Herdr from source with Nix, use the package from nixpkgs instead:
+
+```bash
+nix run nixpkgs#herdr
+```
 
 The flake also exposes a development shell:
 
