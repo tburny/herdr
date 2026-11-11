@@ -39,24 +39,12 @@
             "rust-analyzer"
           ];
         });
-      rustPlatformFor =
-        pkgs:
-        let
-          rustToolchain = rustToolchainFor pkgs;
-        in
-        pkgs.makeRustPlatform {
-          cargo = rustToolchain;
-          rustc = rustToolchain;
-        };
     in
     {
       packages = forAllSystems (
         system:
         let
-          pkgs = pkgsFor system;
-          herdr = pkgs.callPackage ./nix/package.nix {
-            rustPlatform = rustPlatformFor pkgs;
-          };
+          herdr = nixpkgs.legacyPackages.${system}.callPackage ./nix/package.nix { };
         in
         {
           inherit herdr;
@@ -106,12 +94,8 @@
 
       formatter = forAllSystems (system: (pkgsFor system).nixfmt);
 
-      overlays.default = lib.composeExtensions rust-overlay.overlays.default (
-        final: _prev: {
-          herdr = final.callPackage ./nix/package.nix {
-            rustPlatform = rustPlatformFor final;
-          };
-        }
-      );
+      overlays.default = final: _prev: {
+        herdr = final.callPackage ./nix/package.nix { };
+      };
     };
 }
