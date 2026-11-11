@@ -237,6 +237,37 @@ class ReleaseTests(unittest.TestCase):
         (assets / "herdr-macos-aarch64").write_bytes(b"rebuilt")
         self.assertNotEqual(release.pins_json("1.0.1", assets), Path(release.PINS_FILE).read_text())
 
+    def test_stage_record_rejects_draft_assets_swapped_after_the_build(self):
+        built = Path(tempfile.mkdtemp(prefix="herdr-release-built-"))
+        record = Path(tempfile.mkdtemp(prefix="herdr-release-record-"))
+        self.addCleanup(shutil.rmtree, built)
+        self.addCleanup(shutil.rmtree, record)
+        for name in release.ASSETS:
+            (built / name).write_bytes(name.encode())
+        release.write_stage_record("1.0.1", built, record)
+        self.assertEqual(json.loads((record / "pins.json").read_text())["version"], "1.0.1")
+        release.verify_staged(built, record)
+        (built / "herdr-windows-x86_64.zip").write_bytes(b"swapped")
+        with self.assertRaisesRegex(ValueError, "differ from what the stage run built"):
+            release.verify_staged(built, record)
+
+    def test_stage_record_comes_only_from_a_successful_stage_tag_run_at_the_staged_commit(self):
+        source = self.preview
+        runs = [
+            {"id": 7, "head_branch": "stage-v1.0.1", "head_sha": "f" * 40, "event": "push"},
+            {"id": 8, "head_branch": "stage-v1.0.1", "head_sha": source, "event": "workflow_dispatch"},
+            {"id": 5, "head_branch": "stage-v1.0.1", "head_sha": source, "event": "push"},
+            {"id": 3, "head_branch": "stage-v1.0.1", "head_sha": source, "event": "push"},
+        ]
+        downloads = []
+        with mock.patch.object(release.subprocess, "check_output", return_value=json.dumps({"workflow_runs": runs})), \
+                mock.patch.object(release.subprocess, "run", side_effect=lambda args, **kwargs: downloads.append(args)):
+            release.fetch_stage_record("test/repo", "1.0.1", source, Path("record"))
+        self.assertEqual(downloads[0][3], "5")
+        with mock.patch.object(release.subprocess, "check_output", return_value=json.dumps({"workflow_runs": runs[:2]})):
+            with self.assertRaisesRegex(ValueError, "no successful stage-v1.0.1"):
+                release.fetch_stage_record("test/repo", "1.0.1", source, Path("record"))
+
     def test_final_tag_rejects_extra_changes_wrong_pins_or_another_source(self):
         cases = [
             ({"extra": ("src/main.rs", "fn main() { /* unstaged */ }\n")}, "only nix/pins.json"),

@@ -277,19 +277,27 @@ jobs:
             herdr-windows-x86_64.zip/herdr-windows-x86_64.zip
           body_path: RELEASE_NOTES.md
 
-      - name: Report the Nix pins for the staged assets
+      # The draft stays editable by every writer until it is published, so the
+      # pins and the publish check use this record of what CI built instead.
+      - name: Record the staged assets
         run: |
           mkdir staged
-          for asset in herdr-linux-x86_64 herdr-linux-aarch64 herdr-macos-x86_64 herdr-macos-aarch64; do
+          for asset in herdr-linux-x86_64 herdr-linux-aarch64 herdr-macos-x86_64 herdr-macos-aarch64 herdr-windows-x86_64.zip; do
             cp "$asset/$asset" staged/
           done
-          python3 scripts/release.py pins --version "$VERSION" --assets-dir staged --output pins.json
+          python3 scripts/release.py stage-record --version "$VERSION" --assets-dir staged --dir stage-record
           {
             echo "Staged v$VERSION as a draft. Next: \`just release-pin $VERSION\` on the stage-v$VERSION commit."
             echo '```json'
-            cat pins.json
+            cat stage-record/pins.json
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the stage record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: stage-record
+          path: stage-record
 
   nix-validate:
     needs: validate-release-source
@@ -362,6 +370,7 @@ jobs:
     if: (github.repository == 'herdrdev/herdr' || vars.HERDR_RELEASE_FORK_TEST == 'true') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
     env:
       VERSION: ${{ needs.validate-release-source.outputs.version }}
@@ -372,11 +381,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Require the staged assets to match the Nix pins
+      - name: Require the draft assets to match the stage record and the Nix pins
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ needs.validate-release-source.outputs.source_commit }}
         run: |
+          python3 scripts/release.py fetch-stage-record --repo "$GITHUB_REPOSITORY" --version "$VERSION" --commit "$SOURCE_COMMIT" --dir "$RUNNER_TEMP/stage-record"
           python3 scripts/release.py fetch-assets --repo "$GITHUB_REPOSITORY" --tag "v$VERSION" --dir "$RUNNER_TEMP/assets"
+          python3 scripts/release.py verify-staged --assets-dir "$RUNNER_TEMP/assets" --record "$RUNNER_TEMP/stage-record"
           python3 scripts/release.py pins --version "$VERSION" --assets-dir "$RUNNER_TEMP/assets" --check nix/pins.json
 
       - name: Publish the staged release
@@ -393,6 +405,12 @@ jobs:
           git fetch --force origin "refs/tags/v$VERSION:refs/tags/v$VERSION"
           if [ "$(git rev-parse "refs/tags/v$VERSION^{commit}")" != "$GITHUB_SHA" ]; then
             echo "error: v$VERSION does not point at the pinned commit $GITHUB_SHA" >&2
+            exit 1
+          fi
+          # Published assets are immutable; compare GitHub's digests with the record.
+          published="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/v$VERSION" --jq '[.assets[] | {key: .name, value: (.digest | sub("^sha256:"; ""))}] | from_entries')"
+          if [ "$(jq -S . <<<"$published")" != "$(jq -S . "$RUNNER_TEMP/stage-record/sha256.json")" ]; then
+            echo "error: published v$VERSION assets differ from what the stage run built" >&2
             exit 1
           fi
 

@@ -268,10 +268,10 @@ release-pin $version $repo='herdrdev/herdr':
         exit 1; \
     fi
     @set -eu; \
-    assets="$(mktemp -d)"; \
-    trap 'rm -rf "$assets"' EXIT; \
-    python3 scripts/release.py fetch-assets --repo "$repo" --tag "v$version" --dir "$assets"; \
-    python3 scripts/release.py pins --version "$version" --assets-dir "$assets" --output nix/pins.json
+    record="$(mktemp -d)"; \
+    trap 'rm -rf "$record"' EXIT; \
+    python3 scripts/release.py fetch-stage-record --repo "$repo" --version "$version" --commit HEAD --dir "$record"; \
+    cp "$record/pins.json" nix/pins.json
     git add nix/pins.json
     git commit -m "release: pin nix binaries for v$version"
     @set -eu; \

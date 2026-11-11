@@ -198,6 +198,43 @@ def check_tag(tag: str, repo: str) -> tuple[str, str, str, str]:
     return validate_release(preview_tag, source, version, previous, repo, tagged=tag), previous, version, source
 
 
+def asset_digests(assets_dir: Path) -> dict[str, str]:
+    return {name: hashlib.sha256((assets_dir / name).read_bytes()).hexdigest() for name in sorted(ASSETS)}
+
+
+def write_stage_record(version: str, assets_dir: Path, record_dir: Path) -> None:
+    """Record what CI built, so later steps never trust the editable draft release."""
+    record_dir.mkdir(parents=True, exist_ok=True)
+    (record_dir / "sha256.json").write_text(json.dumps(asset_digests(assets_dir), indent=2) + "\n", encoding="utf-8")
+    (record_dir / "pins.json").write_text(pins_json(version, assets_dir), encoding="utf-8")
+
+
+def verify_staged(assets_dir: Path, record_dir: Path) -> None:
+    recorded = json.loads((record_dir / "sha256.json").read_text(encoding="utf-8"))
+    if recorded != asset_digests(assets_dir):
+        raise ValueError("draft release assets differ from what the stage run built")
+
+
+def fetch_stage_record(repo: str, version: str, source: str, directory: Path) -> None:
+    """Download the record of the successful stage-vX.Y.Z run on the staged commit."""
+    stage = f"stage-v{version}"
+    version_tuple(version)
+    runs = json.loads(subprocess.check_output(
+        ["gh", "api", f"repos/{repo}/actions/workflows/release.yml/runs"
+         f"?event=push&branch={stage}&status=success&head_sha={source}&per_page=100"],
+        text=True,
+    ))["workflow_runs"]
+    # Only an admin tag push runs release.yml for this ref at the staged commit.
+    runs = [run for run in runs if run["head_branch"] == stage and run["head_sha"] == source and run["event"] == "push"]
+    if not runs:
+        raise ValueError(f"no successful {stage} release run at {source}")
+    run_id = str(max(run["id"] for run in runs))
+    subprocess.run(
+        ["gh", "run", "download", run_id, "--repo", repo, "--name", "stage-record", "--dir", str(directory)],
+        check=True,
+    )
+
+
 def fetch_assets(repo: str, tag: str, names: list[str], directory: Path) -> None:
     """Download release assets by name, including from a draft release only admins and CI can see."""
     releases = json.loads(subprocess.check_output(
@@ -268,9 +305,19 @@ def main() -> None:
     pins = commands.add_parser("pins")
     pins.add_argument("--version", required=True)
     pins.add_argument("--assets-dir", type=Path, required=True)
-    pins_mode = pins.add_mutually_exclusive_group(required=True)
-    pins_mode.add_argument("--output", type=Path)
-    pins_mode.add_argument("--check", type=Path)
+    pins.add_argument("--check", type=Path, required=True)
+    record = commands.add_parser("stage-record")
+    record.add_argument("--version", required=True)
+    record.add_argument("--assets-dir", type=Path, required=True)
+    record.add_argument("--dir", type=Path, required=True)
+    fetch_record = commands.add_parser("fetch-stage-record")
+    fetch_record.add_argument("--version", required=True)
+    fetch_record.add_argument("--commit", required=True)
+    fetch_record.add_argument("--dir", type=Path, required=True)
+    fetch_record.add_argument("--repo", default="herdrdev/herdr")
+    verify = commands.add_parser("verify-staged")
+    verify.add_argument("--assets-dir", type=Path, required=True)
+    verify.add_argument("--record", type=Path, required=True)
     assets = commands.add_parser("fetch-assets")
     assets.add_argument("--tag", required=True)
     assets.add_argument("--dir", type=Path, required=True)
@@ -287,11 +334,15 @@ def main() -> None:
         validate_release(args.preview, args.commit, args.version, args.previous, args.repo)
     elif args.command == "pins":
         version_tuple(args.version)
-        text = pins_json(args.version, args.assets_dir)
-        if args.output:
-            args.output.write_text(text, encoding="utf-8")
-        elif args.check.read_text(encoding="utf-8") != text:
+        if args.check.read_text(encoding="utf-8") != pins_json(args.version, args.assets_dir):
             raise ValueError(f"{args.check} does not pin the staged {args.version} assets")
+    elif args.command == "stage-record":
+        version_tuple(args.version)
+        write_stage_record(args.version, args.assets_dir, args.dir)
+    elif args.command == "fetch-stage-record":
+        fetch_stage_record(args.repo, args.version, resolve(args.commit), args.dir)
+    elif args.command == "verify-staged":
+        verify_staged(args.assets_dir, args.record)
     elif args.command == "fetch-assets":
         fetch_assets(args.repo, args.tag, args.name or sorted(ASSETS), args.dir)
     else:
