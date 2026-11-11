@@ -381,36 +381,25 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Require the draft assets to match the stage record and the Nix pins
+      - name: Require the Nix pins of the stage record
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_COMMIT: ${{ needs.validate-release-source.outputs.source_commit }}
         run: |
           python3 scripts/release.py fetch-stage-record --repo "$GITHUB_REPOSITORY" --version "$VERSION" --commit "$SOURCE_COMMIT" --dir "$RUNNER_TEMP/stage-record"
-          python3 scripts/release.py fetch-assets --repo "$GITHUB_REPOSITORY" --tag "v$VERSION" --dir "$RUNNER_TEMP/assets"
-          python3 scripts/release.py verify-staged --assets-dir "$RUNNER_TEMP/assets" --record "$RUNNER_TEMP/stage-record"
-          python3 scripts/release.py pins --version "$VERSION" --assets-dir "$RUNNER_TEMP/assets" --check nix/pins.json
+          cmp "$RUNNER_TEMP/stage-record/pins.json" nix/pins.json
 
+      # Every writer can edit the draft. Publish only the release id whose
+      # GitHub-computed asset digests equal the record, then check it again.
       - name: Publish the staged release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          draft="$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
-          if [ "$draft" = "true" ]; then
-            gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false --latest
-          else
-            echo "v$VERSION is already published; continuing the interrupted run."
-          fi
+          python3 scripts/release.py publish-staged --repo "$GITHUB_REPOSITORY" --version "$VERSION" --record "$RUNNER_TEMP/stage-record"
           git fetch --force origin "refs/tags/v$VERSION:refs/tags/v$VERSION"
           if [ "$(git rev-parse "refs/tags/v$VERSION^{commit}")" != "$GITHUB_SHA" ]; then
             echo "error: v$VERSION does not point at the pinned commit $GITHUB_SHA" >&2
-            exit 1
-          fi
-          # Published assets are immutable; compare GitHub's digests with the record.
-          published="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/v$VERSION" --jq '[.assets[] | {key: .name, value: (.digest | sub("^sha256:"; ""))}] | from_entries')"
-          if [ "$(jq -S . <<<"$published")" != "$(jq -S . "$RUNNER_TEMP/stage-record/sha256.json")" ]; then
-            echo "error: published v$VERSION assets differ from what the stage run built" >&2
             exit 1
           fi
 

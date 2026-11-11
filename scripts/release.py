@@ -209,10 +209,42 @@ def write_stage_record(version: str, assets_dir: Path, record_dir: Path) -> None
     (record_dir / "pins.json").write_text(pins_json(version, assets_dir), encoding="utf-8")
 
 
-def verify_staged(assets_dir: Path, record_dir: Path) -> None:
+def release_digests(release: dict) -> dict[str, str]:
+    """Map every asset of a release to the sha256 GitHub computed for it."""
+    digests = {}
+    for asset in release.get("assets", []):
+        digest = asset.get("digest") or ""
+        if not digest.startswith("sha256:"):
+            raise ValueError(f"release asset {asset.get('name')} has no sha256 digest")
+        digests[asset["name"]] = digest.removeprefix("sha256:")
+    return digests
+
+
+def publish_staged(repo: str, version: str, record_dir: Path) -> None:
+    """Publish the draft only if its assets are exactly what the stage run built."""
     recorded = json.loads((record_dir / "sha256.json").read_text(encoding="utf-8"))
-    if recorded != asset_digests(assets_dir):
-        raise ValueError("draft release assets differ from what the stage run built")
+    tag = f"v{version}"
+    releases = json.loads(subprocess.check_output(
+        ["gh", "api", "--paginate", "--slurp", f"repos/{repo}/releases?per_page=100"], text=True
+    ))
+    matches = [release for page in releases for release in page if release["tag_name"] == tag]
+    if len(matches) != 1:
+        raise ValueError(f"expected exactly one release for {tag}, found {len(matches)}")
+    release = matches[0]
+    if release_digests(release) != recorded:
+        raise ValueError(f"release {tag} assets differ from what the stage run built")
+    if release["draft"]:
+        # Publish the release id that was just checked, not whatever the tag resolves to.
+        subprocess.run(
+            ["gh", "api", "-X", "PATCH", f"repos/{repo}/releases/{release['id']}",
+             "-F", "draft=false", "-f", "make_latest=true"],
+            check=True, stdout=subprocess.DEVNULL,
+        )
+    published = json.loads(subprocess.check_output(
+        ["gh", "api", f"repos/{repo}/releases/{release['id']}"], text=True
+    ))
+    if published["draft"] or published["tag_name"] != tag or release_digests(published) != recorded:
+        raise ValueError(f"published {tag} differs from what the stage run built")
 
 
 def fetch_stage_record(repo: str, version: str, source: str, directory: Path) -> None:
@@ -302,10 +334,6 @@ def main() -> None:
     tag.add_argument("--tag", required=True)
     tag.add_argument("--repo", default="herdrdev/herdr")
     tag.add_argument("--github-output", type=Path)
-    pins = commands.add_parser("pins")
-    pins.add_argument("--version", required=True)
-    pins.add_argument("--assets-dir", type=Path, required=True)
-    pins.add_argument("--check", type=Path, required=True)
     record = commands.add_parser("stage-record")
     record.add_argument("--version", required=True)
     record.add_argument("--assets-dir", type=Path, required=True)
@@ -315,9 +343,10 @@ def main() -> None:
     fetch_record.add_argument("--commit", required=True)
     fetch_record.add_argument("--dir", type=Path, required=True)
     fetch_record.add_argument("--repo", default="herdrdev/herdr")
-    verify = commands.add_parser("verify-staged")
-    verify.add_argument("--assets-dir", type=Path, required=True)
-    verify.add_argument("--record", type=Path, required=True)
+    publish = commands.add_parser("publish-staged")
+    publish.add_argument("--version", required=True)
+    publish.add_argument("--record", type=Path, required=True)
+    publish.add_argument("--repo", default="herdrdev/herdr")
     assets = commands.add_parser("fetch-assets")
     assets.add_argument("--tag", required=True)
     assets.add_argument("--dir", type=Path, required=True)
@@ -332,17 +361,14 @@ def main() -> None:
         validate_diff(published_preview(args.preview, args.repo), args.commit)
     elif args.command == "check":
         validate_release(args.preview, args.commit, args.version, args.previous, args.repo)
-    elif args.command == "pins":
-        version_tuple(args.version)
-        if args.check.read_text(encoding="utf-8") != pins_json(args.version, args.assets_dir):
-            raise ValueError(f"{args.check} does not pin the staged {args.version} assets")
     elif args.command == "stage-record":
         version_tuple(args.version)
         write_stage_record(args.version, args.assets_dir, args.dir)
     elif args.command == "fetch-stage-record":
         fetch_stage_record(args.repo, args.version, resolve(args.commit), args.dir)
-    elif args.command == "verify-staged":
-        verify_staged(args.assets_dir, args.record)
+    elif args.command == "publish-staged":
+        version_tuple(args.version)
+        publish_staged(args.repo, args.version, args.record)
     elif args.command == "fetch-assets":
         fetch_assets(args.repo, args.tag, args.name or sorted(ASSETS), args.dir)
     else:

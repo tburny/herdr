@@ -237,7 +237,7 @@ class ReleaseTests(unittest.TestCase):
         (assets / "herdr-macos-aarch64").write_bytes(b"rebuilt")
         self.assertNotEqual(release.pins_json("1.0.1", assets), Path(release.PINS_FILE).read_text())
 
-    def test_stage_record_rejects_draft_assets_swapped_after_the_build(self):
+    def test_publish_staged_requires_exactly_the_recorded_assets(self):
         built = Path(tempfile.mkdtemp(prefix="herdr-release-built-"))
         record = Path(tempfile.mkdtemp(prefix="herdr-release-record-"))
         self.addCleanup(shutil.rmtree, built)
@@ -246,10 +246,30 @@ class ReleaseTests(unittest.TestCase):
             (built / name).write_bytes(name.encode())
         release.write_stage_record("1.0.1", built, record)
         self.assertEqual(json.loads((record / "pins.json").read_text())["version"], "1.0.1")
-        release.verify_staged(built, record)
-        (built / "herdr-windows-x86_64.zip").write_bytes(b"swapped")
-        with self.assertRaisesRegex(ValueError, "differ from what the stage run built"):
-            release.verify_staged(built, record)
+        recorded = json.loads((record / "sha256.json").read_text())
+        good = [{"name": name, "digest": f"sha256:{digest}"} for name, digest in recorded.items()]
+
+        def run(assets, published_assets=None):
+            draft = {"id": 42, "tag_name": "v1.0.1", "draft": True, "assets": assets}
+            published = {**draft, "draft": False, "assets": published_assets or assets}
+            calls = []
+
+            def output(args, **kwargs):
+                return json.dumps([[draft]] if "--paginate" in args else published)
+
+            with mock.patch.object(release.subprocess, "check_output", side_effect=output), \
+                    mock.patch.object(release.subprocess, "run", side_effect=lambda args, **kwargs: calls.append(args)):
+                release.publish_staged("test/repo", "1.0.1", record)
+            return calls
+
+        self.assertIn("repos/test/repo/releases/42", run(good)[0])
+        swapped = [dict(good[0], digest="sha256:" + "0" * 64), *good[1:]]
+        for assets in (swapped, [*good, {"name": "extra", "digest": "sha256:" + "1" * 64}], good[1:],
+                       [dict(good[0], digest=None), *good[1:]]):
+            with self.assertRaisesRegex(ValueError, "differ|no sha256 digest"):
+                run(assets)
+        with self.assertRaisesRegex(ValueError, "published v1.0.1 differs"):
+            run(good, published_assets=swapped)
 
     def test_stage_record_comes_only_from_a_successful_stage_tag_run_at_the_staged_commit(self):
         source = self.preview
