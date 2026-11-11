@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   preflight:
-    if: github.repository == 'herdrdev/herdr' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/preview-')
+    if: (github.repository == 'herdrdev/herdr' || vars.HERDR_RELEASE_FORK_TEST == 'true') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/preview-')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -134,7 +134,7 @@ jobs:
 
   build:
     needs: preflight
-    if: github.repository == 'herdrdev/herdr' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/preview-') && needs.preflight.outputs.should_publish == 'true'
+    if: (github.repository == 'herdrdev/herdr' || vars.HERDR_RELEASE_FORK_TEST == 'true') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/preview-') && needs.preflight.outputs.should_publish == 'true'
     permissions:
       contents: read
     strategy:
@@ -283,7 +283,7 @@ jobs:
 
   publish:
     needs: [preflight, build]
-    if: github.repository == 'herdrdev/herdr' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/preview-') && needs.preflight.outputs.should_publish == 'true'
+    if: (github.repository == 'herdrdev/herdr' || vars.HERDR_RELEASE_FORK_TEST == 'true') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/preview-') && needs.preflight.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     concurrency:
       group: docs-publish-master
@@ -425,7 +425,19 @@ jobs:
             --sha-file preview-sha256.json \
             --retain 30
 
+      - name: Check for the bot token
+        id: bot-token
+        env:
+          KANGAL_GITHUB_TOKEN: ${{ secrets.KANGAL_GITHUB_TOKEN }}
+        run: |
+          if [ -n "$KANGAL_GITHUB_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::KANGAL_GITHUB_TOKEN is not set; skipping the preview manifest commit and issue updates."
+          fi
+
       - name: Commit preview publication
+        if: steps.bot-token.outputs.present == 'true'
         env:
           KANGAL_GITHUB_TOKEN: ${{ secrets.KANGAL_GITHUB_TOKEN }}
         run: |
@@ -450,6 +462,7 @@ jobs:
           exit 1
 
       - name: Mark preview-released issues
+        if: steps.bot-token.outputs.present == 'true'
         continue-on-error: true
         shell: bash
         env:

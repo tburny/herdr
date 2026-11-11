@@ -44,9 +44,11 @@ describe("official publishing workflow boundaries", () => {
     expect(adminGate.run).not.toContain("ogulcancelik");
   });
 
-  test("release jobs stay on the canonical repository unless a fork opts in", () => {
-    for (const [name, job] of Object.entries(release.jobs) as [string, any][]) {
-      expect(job.if, name).toContain("(github.repository == 'herdrdev/herdr' || vars.HERDR_RELEASE_FORK_TEST == 'true')");
+  test("publishing jobs stay on the canonical repository unless a fork opts in", () => {
+    for (const workflow of [preview, release]) {
+      for (const [name, job] of Object.entries(workflow.jobs) as [string, any][]) {
+        expect(job.if, name).toContain("(github.repository == 'herdrdev/herdr' || vars.HERDR_RELEASE_FORK_TEST == 'true')");
+      }
     }
   });
 
