@@ -195,7 +195,7 @@ preview $ref='HEAD':
     git push origin "refs/tags/$tag"
 
 # In a checkout based on the selected preview, prepare release-only metadata.
-release-prepare $version $preview:
+release-prepare $version $preview $repo='herdrdev/herdr':
     @printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { \
         echo "error: version must look like 0.6.6 without a v prefix"; \
         exit 1; \
@@ -211,7 +211,7 @@ release-prepare $version $preview:
         echo "error: tag v$version already exists"; \
         exit 1; \
     fi
-    python3 scripts/release.py check-source --preview "$preview"
+    python3 scripts/release.py check-source --preview "$preview" --repo "$repo"
     just pre-release-check
     python3 scripts/changelog.py prepare --version "$version"
     cp CHANGELOG.md docs/next/CHANGELOG.md
@@ -220,11 +220,11 @@ release-prepare $version $preview:
     just check
     git add CHANGELOG.md docs/next/CHANGELOG.md Cargo.toml Cargo.lock skills/herdr/SKILL.md
     git diff --cached --quiet || git commit -m "release: v$version"
-    python3 scripts/release.py check-source --preview "$preview"
+    python3 scripts/release.py check-source --preview "$preview" --repo "$repo"
     @echo "v$version release commit prepared. Review it, then run: just release-publish $version $preview"
 
-# Tag a prepared preview-based release; never move master to the release candidate.
-release-publish $version $preview:
+# Stage a prepared preview-based release for building; never move master to the release candidate.
+release-publish $version $preview $repo='herdrdev/herdr':
     @printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { \
         echo "error: version must look like 0.6.6 without a v prefix"; \
         exit 1; \
@@ -234,8 +234,8 @@ release-publish $version $preview:
         exit 1; \
     fi
     @git fetch origin master --tags
-    @if git rev-parse "v$version" >/dev/null 2>&1; then \
-        echo "error: tag v$version already exists"; \
+    @if git rev-parse "v$version" >/dev/null 2>&1 || git rev-parse "stage-v$version" >/dev/null 2>&1; then \
+        echo "error: tag v$version or stage-v$version already exists"; \
         exit 1; \
     fi
     @cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"; \
@@ -247,15 +247,44 @@ release-publish $version $preview:
     python3 scripts/changelog.py extract --version "$version" --output /tmp/herdr-release-notes-check.md
     rm -f /tmp/herdr-release-notes-check.md
     @previous="$(git show origin/master:distribution/latest.json | python3 -c 'import json,sys; print("v" + json.load(sys.stdin)["version"])')"; \
-    python3 scripts/release.py check --preview "$preview" --version "$version" --previous "$previous" && \
-    git tag -a "v$version" -m "v$version" -m "Preview: $preview" -m "Previous-Stable: $previous"
+    python3 scripts/release.py check --preview "$preview" --version "$version" --previous "$previous" --repo "$repo" && \
+    git tag -a "stage-v$version" -m "stage-v$version" -m "Preview: $preview" -m "Previous-Stable: $previous"
+    git push origin "stage-v$version"
+    @echo "stage-v$version pushed — GitHub Actions is building and staging a draft release. When it succeeds, run: just release-pin $version"
+
+# Pin the staged binaries for the Nix flake and tag the release on that commit.
+release-pin $version $repo='herdrdev/herdr':
+    @printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { \
+        echo "error: version must look like 0.6.6 without a v prefix"; \
+        exit 1; \
+    }
+    @if [ -n "$(git status --porcelain)" ]; then \
+        echo "error: working tree must be clean before pinning"; \
+        exit 1; \
+    fi
+    @git fetch origin --tags
+    @if [ "$(git rev-parse HEAD)" != "$(git rev-parse "stage-v$version^{commit}")" ]; then \
+        echo "error: check out the commit tagged stage-v$version first"; \
+        exit 1; \
+    fi
+    @set -eu; \
+    assets="$(mktemp -d)"; \
+    trap 'rm -rf "$assets"' EXIT; \
+    python3 scripts/release.py fetch-assets --repo "$repo" --tag "v$version" --dir "$assets"; \
+    python3 scripts/release.py pins --version "$version" --assets-dir "$assets" --output nix/pins.json
+    git add nix/pins.json
+    git commit -m "release: pin nix binaries for v$version"
+    @set -eu; \
+    message="$(git for-each-ref --format='%(contents)' "refs/tags/stage-v$version" | sed "s/^stage-v$version\$/v$version/")"; \
+    git tag -a "v$version" -m "$message"
+    python3 scripts/release.py check-tag --repo "$repo" --tag "v$version"
     git push origin "v$version"
-    @echo "v$version released — GitHub Actions building binaries and updating distribution/latest.json"
+    @echo "v$version pushed — GitHub Actions validates the Nix flake, then publishes the staged release and updates distribution/latest.json"
 
 # Prepare and promote a published preview, not the latest master.
-release $version $preview:
-    just release-prepare "$version" "$preview"
-    just release-publish "$version" "$preview"
+release $version $preview $repo='herdrdev/herdr':
+    just release-prepare "$version" "$preview" "$repo"
+    just release-publish "$version" "$preview" "$repo"
 
 # Print default config
 default-config:

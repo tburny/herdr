@@ -1,8 +1,15 @@
 name: Release
 
+# Stable releases build before they are tagged, because a tagged commit
+# cannot contain the hashes of binaries built from it. An admin pushes
+# stage-vX.Y.Z on the prepared commit A: CI builds the assets and stages them
+# in a draft release. The admin then commits nix/pins.json on top of A (commit
+# P, `just release-pin`) and pushes vX.Y.Z on P: CI validates the binary flake
+# at P, pushes it to Cachix and publishes the staged assets without rebuilding.
 on:
   push:
     tags:
+      - "stage-v*"
       - "v*"
 
 permissions:
@@ -14,11 +21,13 @@ env:
 
 jobs:
   validate-release-source:
-    if: github.repository == 'herdrdev/herdr' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: (github.repository == 'herdrdev/herdr' || vars.HERDR_RELEASE_FORK_TEST == 'true') && github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/stage-v') || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     outputs:
       preview_commit: ${{ steps.source.outputs.preview_commit }}
       previous_tag: ${{ steps.source.outputs.previous_tag }}
+      version: ${{ steps.source.outputs.version }}
+      source_commit: ${{ steps.source.outputs.source_commit }}
     steps:
       - &require-release-admins
         name: Require repository admins for publishing and reruns
@@ -44,11 +53,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           git fetch origin master:refs/remotes/origin/master --tags
-          python3 scripts/release.py check-tag --tag "$GITHUB_REF_NAME" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/release.py check-tag --tag "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --github-output "$GITHUB_OUTPUT"
 
   flake-check:
     needs: validate-release-source
-    if: github.repository == 'herdrdev/herdr'
+    if: (github.repository == 'herdrdev/herdr' || vars.HERDR_RELEASE_FORK_TEST == 'true') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/stage-v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -72,7 +81,7 @@ jobs:
 
   build:
     needs: validate-release-source
-    if: github.repository == 'herdrdev/herdr'
+    if: (github.repository == 'herdrdev/herdr' || vars.HERDR_RELEASE_FORK_TEST == 'true') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/stage-v')
     permissions:
       contents: read
     strategy:
@@ -108,6 +117,7 @@ jobs:
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ${{ matrix.libghostty_vt_optimize }}
       LIBGHOSTTY_VT_SIMD: ${{ matrix.libghostty_vt_simd }}
+      VERSION: ${{ needs.validate-release-source.outputs.version }}
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -118,7 +128,7 @@ jobs:
         shell: bash
         run: |
           CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          TAG_VERSION="$VERSION"
           if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
             echo "error: tag $GITHUB_REF_NAME doesn't match Cargo.toml version $CARGO_VERSION"
             exit 1
@@ -189,7 +199,7 @@ jobs:
             -StageDir $stage `
             -OutputPath ${{ matrix.name }}
           $version = (& (Join-Path $stage "herdr.exe") --version | Out-String).Trim()
-          $tagVersion = $env:GITHUB_REF_NAME -replace '^v', ''
+          $tagVersion = $env:VERSION
           if ($version -notmatch [regex]::Escape($tagVersion) -or $version -match "preview") {
             throw "Packaged Windows binary has unexpected version identity: $version"
           }
@@ -202,7 +212,7 @@ jobs:
 
   validate-release-inputs:
     needs: validate-release-source
-    if: github.repository == 'herdrdev/herdr'
+    if: (github.repository == 'herdrdev/herdr' || vars.HERDR_RELEASE_FORK_TEST == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -229,12 +239,14 @@ jobs:
           test -f docs/next/README.md
           test -f docs/next/README.zh-CN.md
 
-  release:
-    needs: [build, flake-check, validate-release-inputs]
-    if: github.repository == 'herdrdev/herdr' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+  stage-release:
+    needs: [build, flake-check, validate-release-inputs, validate-release-source]
+    if: (github.repository == 'herdrdev/herdr' || vars.HERDR_RELEASE_FORK_TEST == 'true') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/stage-v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      VERSION: ${{ needs.validate-release-source.outputs.version }}
 
     steps:
       - *require-release-admins
@@ -246,11 +258,17 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
 
       - name: Extract release notes from changelog
-        run: python3 scripts/changelog.py extract --version "${GITHUB_REF_NAME#v}" --output RELEASE_NOTES.md
+        run: python3 scripts/changelog.py extract --version "$VERSION" --output RELEASE_NOTES.md
 
-      - name: Create release
+      # A draft is visible only to accounts with push access; it is published
+      # unchanged once vX.Y.Z is tagged on the commit that pins these assets.
+      - name: Stage draft release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
+          tag_name: v${{ env.VERSION }}
+          target_commitish: ${{ needs.validate-release-source.outputs.source_commit }}
+          draft: true
+          overwrite_files: true
           files: |
             herdr-linux-x86_64/herdr-linux-x86_64
             herdr-linux-aarch64/herdr-linux-aarch64
@@ -259,29 +277,128 @@ jobs:
             herdr-windows-x86_64.zip/herdr-windows-x86_64.zip
           body_path: RELEASE_NOTES.md
 
-  update-nix-package:
-    needs: release
-    if: github.repository == 'herdrdev/herdr' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    continue-on-error: true
-    permissions: {}
+      - name: Report the Nix pins for the staged assets
+        run: |
+          mkdir staged
+          for asset in herdr-linux-x86_64 herdr-linux-aarch64 herdr-macos-x86_64 herdr-macos-aarch64; do
+            cp "$asset/$asset" staged/
+          done
+          python3 scripts/release.py pins --version "$VERSION" --assets-dir staged --output pins.json
+          {
+            echo "Staged v$VERSION as a draft. Next: \`just release-pin $VERSION\` on the stage-v$VERSION commit."
+            echo '```json'
+            cat pins.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  nix-validate:
+    needs: validate-release-source
+    if: (github.repository == 'herdrdev/herdr' || vars.HERDR_RELEASE_FORK_TEST == 'true') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            os: ubuntu-latest
+            asset: herdr-linux-x86_64
+          - system: aarch64-linux
+            os: ubuntu-24.04-arm
+            asset: herdr-linux-aarch64
+          - system: x86_64-darwin
+            os: macos-15-intel
+            asset: herdr-macos-x86_64
+          - system: aarch64-darwin
+            os: macos-latest
+            asset: herdr-macos-aarch64
+    runs-on: ${{ matrix.os }}
+    # Reading the draft release requires push access.
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.validate-release-source.outputs.version }}
 
     steps:
       - *require-release-admins
-      - name: Trigger stable Nix package update
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Download the staged asset
         env:
-          GH_TOKEN: ${{ secrets.HERDR_NIX_DISPATCH_TOKEN }}
-          GH_HOST: github.com
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release.py fetch-assets --repo "$GITHUB_REPOSITORY" --tag "v$VERSION" --dir "$RUNNER_TEMP/assets" --name "${{ matrix.asset }}"
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            always-allow-substitutes = true
+
+      # The assets are not public yet, so the flake's fixed-output fetch must
+      # find the exact file in the store instead of downloading it.
+      - name: Build the binary flake from the staged asset
+        env:
+          ASSET: ${{ matrix.asset }}
         run: |
-          if ! gh workflow run update-check.yml --repo herdrdev/herdr-nix --ref main; then
-            echo "::warning::Nix update could not be triggered. The Herdr release is already published; run update-check manually in herdrdev/herdr-nix."
+          nix-store --add-fixed sha256 "$RUNNER_TEMP/assets/$ASSET"
+          nix build .#packages.${{ matrix.system }}.default --print-build-logs
+          cmp result/bin/herdr "$RUNNER_TEMP/assets/$ASSET"
+          result/bin/herdr --version | grep -F "$VERSION"
+
+      - name: Push to Cachix
+        continue-on-error: true
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          if [ -z "$CACHIX_AUTH_TOKEN" ]; then
+            echo "::notice::CACHIX_AUTH_TOKEN is not set; skipping the Cachix push."
+            exit 0
+          fi
+          nix run --inputs-from . nixpkgs#cachix -- push herdr ./result
+
+  release:
+    needs: [nix-validate, validate-release-inputs, validate-release-source]
+    if: (github.repository == 'herdrdev/herdr' || vars.HERDR_RELEASE_FORK_TEST == 'true') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.validate-release-source.outputs.version }}
+
+    steps:
+      - *require-release-admins
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Require the staged assets to match the Nix pins
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/release.py fetch-assets --repo "$GITHUB_REPOSITORY" --tag "v$VERSION" --dir "$RUNNER_TEMP/assets"
+          python3 scripts/release.py pins --version "$VERSION" --assets-dir "$RUNNER_TEMP/assets" --check nix/pins.json
+
+      - name: Publish the staged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          draft="$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          if [ "$draft" = "true" ]; then
+            gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          else
+            echo "v$VERSION is already published; continuing the interrupted run."
+          fi
+          git fetch --force origin "refs/tags/v$VERSION:refs/tags/v$VERSION"
+          if [ "$(git rev-parse "refs/tags/v$VERSION^{commit}")" != "$GITHUB_SHA" ]; then
+            echo "error: v$VERSION does not point at the pinned commit $GITHUB_SHA" >&2
             exit 1
           fi
 
   close-released-issues:
     needs: [release, validate-release-source]
-    if: github.repository == 'herdrdev/herdr' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: (github.repository == 'herdrdev/herdr' || vars.HERDR_RELEASE_FORK_TEST == 'true') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     continue-on-error: true
     permissions:
@@ -295,7 +412,19 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Check for the issue automation token
+        id: issue-token
+        env:
+          KANGAL_GITHUB_TOKEN: ${{ secrets.KANGAL_GITHUB_TOKEN }}
+        run: |
+          if [ -n "$KANGAL_GITHUB_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::KANGAL_GITHUB_TOKEN is not set; skipping issue updates."
+          fi
+
       - name: Close issues referenced by released commits
+        if: steps.issue-token.outputs.present == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.KANGAL_GITHUB_TOKEN }}
@@ -413,7 +542,7 @@ jobs:
 
   update-latest-json:
     needs: [release, validate-release-source]
-    if: github.repository == 'herdrdev/herdr' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: (github.repository == 'herdrdev/herdr' || vars.HERDR_RELEASE_FORK_TEST == 'true') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     concurrency:
       group: docs-publish-master

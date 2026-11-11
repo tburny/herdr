@@ -1,6 +1,8 @@
 """Validate stable source promotion; never build, tag, push, or publish a release."""
 
 import argparse
+import base64
+import hashlib
 import json
 import re
 import subprocess
@@ -22,6 +24,14 @@ ASSETS = {
     "herdr-macos-x86_64",
     "herdr-macos-aarch64",
     "herdr-windows-x86_64.zip",
+}
+PINS_FILE = "nix/pins.json"
+# Nix systems and the release asset the binary flake installs on each.
+NIX_ASSETS = {
+    "x86_64-linux": "herdr-linux-x86_64",
+    "aarch64-linux": "herdr-linux-aarch64",
+    "x86_64-darwin": "herdr-macos-x86_64",
+    "aarch64-darwin": "herdr-macos-aarch64",
 }
 
 
@@ -107,8 +117,8 @@ def validate_diff(preview: str, candidate: str, version: str | None = None) -> N
 
 
 def tag_metadata(tag: str) -> tuple[str, str]:
-    if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
-        raise ValueError("expected a stable vX.Y.Z tag")
+    if not re.fullmatch(r"(stage-)?v[0-9]+\.[0-9]+\.[0-9]+", tag):
+        raise ValueError("expected a stable stage-vX.Y.Z or vX.Y.Z tag")
     if git("cat-file", "-t", f"refs/tags/{tag}") != "tag":
         raise ValueError("stable releases require an annotated tag with preview provenance")
     message = git("for-each-ref", "--format=%(contents)", f"refs/tags/{tag}")
@@ -123,7 +133,9 @@ def tag_metadata(tag: str) -> tuple[str, str]:
     return fields[0], fields[1]
 
 
-def validate_release(preview_tag: str, candidate: str, version: str, previous: str, repo: str) -> str:
+def validate_release(
+    preview_tag: str, candidate: str, version: str, previous: str, repo: str, tagged: str | None = None
+) -> str:
     preview = published_preview(preview_tag, repo)
     validate_diff(preview, candidate, version)
     current = json.loads(git("show", "origin/master:distribution/latest.json"))["version"]
@@ -131,12 +143,80 @@ def validate_release(preview_tag: str, candidate: str, version: str, previous: s
         raise ValueError("stable version must increase from Previous-Stable")
     if current == version:
         # A retry after distribution publication must still validate the original boundary.
-        if resolve(f"refs/tags/v{version}") != resolve(candidate):
+        if resolve(f"refs/tags/v{version}") != resolve(tagged or candidate):
             raise ValueError("published stable version points at different source")
     elif previous != f"v{current}":
         raise ValueError("Previous-Stable must name the currently published stable release")
     resolve(f"refs/tags/{previous}")
     return preview
+
+
+def pins_json(version: str, assets_dir: Path) -> str:
+    assets = {}
+    for system, name in NIX_ASSETS.items():
+        digest = hashlib.sha256((assets_dir / name).read_bytes()).digest()
+        assets[system] = {"name": name, "hash": "sha256-" + base64.b64encode(digest).decode()}
+    return json.dumps({"version": version, "assets": assets}, indent=2) + "\n"
+
+
+def pinned_source(tag: str, version: str) -> str:
+    """Return commit A for a final tag on P, where P = A + nix/pins.json only."""
+    parents = git("rev-list", "--parents", "-n", "1", f"{tag}^{{commit}}").split()[1:]
+    if len(parents) != 1:
+        raise ValueError(f"{tag} must point at a single-parent commit that only pins the Nix binaries")
+    source = parents[0]
+    if git("diff", "--no-renames", "--name-only", source, tag).splitlines() != [PINS_FILE]:
+        raise ValueError(f"{tag} may change only {PINS_FILE} on top of the staged commit")
+    if git("ls-tree", tag, "--", PINS_FILE).split()[:2] != ["100644", "blob"]:
+        raise ValueError(f"{PINS_FILE} must be a regular file")
+    stage = f"stage-v{version}"
+    if resolve(f"refs/tags/{stage}") != source:
+        raise ValueError(f"{tag} must sit directly on the commit tagged {stage}, whose assets were staged")
+    if tag_metadata(stage) != tag_metadata(tag):
+        raise ValueError(f"{tag} and {stage} must name the same Preview and Previous-Stable")
+    pins = json.loads(git("show", f"{tag}:{PINS_FILE}"))
+    if pins.get("version") != version or {
+        system: asset.get("name") for system, asset in pins.get("assets", {}).items()
+    } != NIX_ASSETS:
+        raise ValueError(f"{PINS_FILE} must pin the {version} assets for every Nix system")
+    return source
+
+
+def check_tag(tag: str, repo: str) -> tuple[str, str, str, str]:
+    """Validate a stage or final tag; return preview commit, previous tag, version and source commit."""
+    preview_tag, previous = tag_metadata(tag)
+    version = tag.removeprefix("stage-")[1:]
+    if tag.startswith("stage-"):
+        if subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/tags/v{version}"],
+            check=False, capture_output=True,
+        ).returncode == 0:
+            raise ValueError(f"v{version} is already tagged; staging is closed")
+        source = resolve(tag)
+        return validate_release(preview_tag, tag, version, previous, repo), previous, version, source
+    source = pinned_source(tag, version)
+    return validate_release(preview_tag, source, version, previous, repo, tagged=tag), previous, version, source
+
+
+def fetch_assets(repo: str, tag: str, names: list[str], directory: Path) -> None:
+    """Download release assets by name, including from a draft release only admins and CI can see."""
+    releases = json.loads(subprocess.check_output(
+        ["gh", "api", "--paginate", "--slurp", f"repos/{repo}/releases?per_page=100"], text=True
+    ))
+    matches = [release for page in releases for release in page if release["tag_name"] == tag]
+    if len(matches) != 1:
+        raise ValueError(f"expected exactly one release for {tag}, found {len(matches)}")
+    available = {asset["name"]: asset["id"] for asset in matches[0]["assets"]}
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        if name not in available:
+            raise ValueError(f"release {tag} has no asset {name}")
+        with (directory / name).open("wb") as output:
+            subprocess.run(
+                ["gh", "api", "-H", "Accept: application/octet-stream",
+                 f"repos/{repo}/releases/assets/{available[name]}"],
+                stdout=output, check=True,
+            )
 
 
 def select_hotfix(branch: str, base: str) -> str:
@@ -185,6 +265,17 @@ def main() -> None:
     tag.add_argument("--tag", required=True)
     tag.add_argument("--repo", default="herdrdev/herdr")
     tag.add_argument("--github-output", type=Path)
+    pins = commands.add_parser("pins")
+    pins.add_argument("--version", required=True)
+    pins.add_argument("--assets-dir", type=Path, required=True)
+    pins_mode = pins.add_mutually_exclusive_group(required=True)
+    pins_mode.add_argument("--output", type=Path)
+    pins_mode.add_argument("--check", type=Path)
+    assets = commands.add_parser("fetch-assets")
+    assets.add_argument("--tag", required=True)
+    assets.add_argument("--dir", type=Path, required=True)
+    assets.add_argument("--repo", default="herdrdev/herdr")
+    assets.add_argument("--name", action="append", choices=sorted(ASSETS))
     preview = commands.add_parser("preview-source")
     preview.add_argument("--commit", default="HEAD")
     args = parser.parse_args()
@@ -194,13 +285,24 @@ def main() -> None:
         validate_diff(published_preview(args.preview, args.repo), args.commit)
     elif args.command == "check":
         validate_release(args.preview, args.commit, args.version, args.previous, args.repo)
+    elif args.command == "pins":
+        version_tuple(args.version)
+        text = pins_json(args.version, args.assets_dir)
+        if args.output:
+            args.output.write_text(text, encoding="utf-8")
+        elif args.check.read_text(encoding="utf-8") != text:
+            raise ValueError(f"{args.check} does not pin the staged {args.version} assets")
+    elif args.command == "fetch-assets":
+        fetch_assets(args.repo, args.tag, args.name or sorted(ASSETS), args.dir)
     else:
-        preview, previous = tag_metadata(args.tag)
-        commit = validate_release(preview, args.tag, args.tag[1:], previous, args.repo)
+        commit, previous, version, source = check_tag(args.tag, args.repo)
         if args.github_output:
             with args.github_output.open("a", encoding="utf-8") as output:
-                output.write(f"preview_commit={commit}\nprevious_tag={previous}\n")
-        print(f"{args.tag} promotes {preview}; previous stable: {previous}")
+                output.write(
+                    f"preview_commit={commit}\nprevious_tag={previous}\n"
+                    f"version={version}\nsource_commit={source}\n"
+                )
+        print(f"{args.tag} promotes {commit} as v{version} from {source}; previous stable: {previous}")
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ const adminGate = release.jobs["validate-release-source"].steps[0];
 describe("official publishing workflow boundaries", () => {
   test("publishing is tag-only while normal PR CI remains enabled", () => {
     expect(preview.on).toEqual({ push: { tags: ["preview-*"] } });
-    expect(release.on).toEqual({ push: { tags: ["v*"] } });
+    expect(release.on).toEqual({ push: { tags: ["stage-v*", "v*"] } });
     expect(load("ci").on.pull_request).toBeDefined();
   });
 
@@ -30,7 +30,7 @@ describe("official publishing workflow boundaries", () => {
   test("each publishing job rechecks both actors before using credentials", () => {
     for (const [workflow, names] of [
       [preview, ["preflight", "publish"]],
-      [release, ["validate-release-source", "release", "update-nix-package", "close-released-issues", "update-latest-json"]],
+      [release, ["validate-release-source", "stage-release", "nix-validate", "release", "close-released-issues", "update-latest-json"]],
     ] as const) {
       for (const name of names) {
         const job = workflow.jobs[name];
@@ -44,13 +44,30 @@ describe("official publishing workflow boundaries", () => {
     expect(adminGate.run).not.toContain("ogulcancelik");
   });
 
+  test("release jobs stay on the canonical repository unless a fork opts in", () => {
+    for (const [name, job] of Object.entries(release.jobs) as [string, any][]) {
+      expect(job.if, name).toContain("(github.repository == 'herdrdev/herdr' || vars.HERDR_RELEASE_FORK_TEST == 'true')");
+    }
+  });
+
+  test("the final tag publishes only after the binary flake validates at the pinned commit", () => {
+    expect(release.jobs.release.needs).toContain("nix-validate");
+    expect(release.jobs.release.if).toContain("refs/tags/v");
+    expect(release.jobs["stage-release"].if).toContain("refs/tags/stage-v");
+    expect(release.jobs.build.if).toContain("refs/tags/stage-v");
+    expect(release.jobs["nix-validate"].strategy.matrix.include.map((entry: any) => entry.system)).toEqual([
+      "x86_64-linux", "aarch64-linux", "x86_64-darwin", "aarch64-darwin",
+    ]);
+  });
+
   test("release arguments are not interpolated into executable shell text", () => {
     const input = `untrusted'\"$(echo unexpected-command)`;
     for (const args of [
       ["preview", input],
-      ["release-prepare", input, input],
-      ["release-publish", input, input],
-      ["release", input, input],
+      ["release-prepare", input, input, input],
+      ["release-publish", input, input, input],
+      ["release", input, input, input],
+      ["release-pin", input, input],
     ]) {
       const result = spawnSync("just", ["--dry-run", ...args], { encoding: "utf8" });
       expect(result.status).toBe(0);

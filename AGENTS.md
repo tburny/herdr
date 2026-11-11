@@ -294,13 +294,15 @@ Stable releases start in an isolated checkout at the selected published preview 
 ```bash
 just check
 just release 0.x.y preview-<build-id>
+# after the stage run has staged the draft release:
+just release-pin 0.x.y
 ```
 
-Before stable release, run `/pre-release-audit` against the currently published stable tag, finalize `docs/next`, and run `just pre-release-check` to validate the staged docs, distribution contract, and render scaling. `just release` prepares the changelog and release commit, validates the preview-to-release diff, and pushes only an annotated stable tag. Its `Preview` and `Previous-Stable` trailers are required provenance, not optional notes. `just release-prepare` and `just release-publish` also require the preview tag argument. Do not merge or rebase newer master commits into the candidate.
+Before stable release, run `/pre-release-audit` against the currently published stable tag, finalize `docs/next`, and run `just pre-release-check` to validate the staged docs, distribution contract, and render scaling. `just release` prepares the changelog and release commit, validates the preview-to-release diff, and pushes only an annotated `stage-v0.x.y` tag on that commit. CI builds the assets and stages them in a draft release. `just release-pin`, run on the staged commit, writes the staged assets' hashes to `nix/pins.json`, commits only that file, and pushes the annotated `v0.x.y` tag on the new commit. CI checks that the final tag differs from the staged commit only by `nix/pins.json`, builds the binary Nix flake from the staged assets on all four Nix systems, pushes it to the `herdr` Cachix cache, and publishes the staged assets without rebuilding them. Both tags carry the same `Preview` and `Previous-Stable` trailers; they are required provenance, not optional notes. `just release-prepare` and `just release-publish` also require the preview tag argument. Do not merge or rebase newer master commits into the candidate.
 
 Only the Herdr package version in Cargo.toml/Cargo.lock, changelogs, staged READMEs, staged website prose, product announcement, and stable skill may differ from the preview. Code, dependencies, API schemas, build configuration, and other files must match. These checks run locally and in CI before stable builds. Old previews without this promotion tooling require a new preview first. Stable rebuilds the selected source with stable version identity; it does not reuse preview binaries.
 
-GitHub Actions builds binaries, creates the GitHub release, closes issues using the recorded previous stable boundary, snapshots the tagged docs, and updates `distribution/latest.json`. It applies only the release-preparation diff back to master with a three-way merge, preserving newer development. A conflict stops distribution publication and needs manual resolution; do not resolve it by copying the whole release tree over master. Remove temporary release/hotfix branches after publication and metadata reconciliation. The private website repository owns rendering and deployment.
+GitHub Actions builds binaries, stages and publishes the GitHub release, closes issues using the recorded previous stable boundary, snapshots the tagged docs, and updates `distribution/latest.json`. It applies only the release-preparation diff back to master with a three-way merge, preserving newer development. A conflict stops distribution publication and needs manual resolution; do not resolve it by copying the whole release tree over master. Remove temporary release/hotfix branches after publication and metadata reconciliation. The private website repository owns rendering and deployment.
 
 Before the first stable Windows release, publish and verify a preview containing stable-channel support. Existing Windows preview users need that preview before `herdr channel set stable` can migrate them.
 
@@ -314,7 +316,7 @@ The release workflows must publish these five assets:
 
 The Windows archive must contain `herdr.exe` and its app-local ConPTY runtime. Do not publish a bare executable as the stable Windows asset.
 
-`nix/package.nix` imports `Cargo.lock` directly with `cargoLock.lockFile`, so release version bumps do not require a separate Nix cargo hash update. If Cargo git dependencies are added later, add the required `cargoLock.outputHashes` entries as part of that dependency change.
+The flake's `packages.default` installs the release asset for the host Nix system byte for byte, as pinned in `nix/pins.json`. Only `just release-pin` writes that file. The flake does not build Herdr from source; nixpkgs carries a source build as `pkgs.herdr`. The development shell still uses `rust-toolchain.toml` through rust-overlay.
 
 ## External contributor guardrail
 

@@ -1,5 +1,8 @@
+import base64
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -202,6 +205,55 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(Path("src/feature.rs").read_text(), "b and c\n")
         self.assertNotIn("fix d", Path("src/main.rs").read_text())
         self.assertEqual(release.normalized_cargo(Path("Cargo.toml").read_text(), "Cargo.toml")[1], "1.0.1")
+
+    def tag_release(self, tag, commit="HEAD"):
+        self.git("tag", "-af", tag, "-m", f"{tag}\n\nPreview: preview-test\nPrevious-Stable: v1.0.0", commit)
+
+    def stage_and_pin(self, pins_version="1.0.1", extra=None):
+        candidate = self.prepare()
+        self.tag_release("stage-v1.0.1")
+        assets = Path(tempfile.mkdtemp(prefix="herdr-release-assets-"))
+        self.addCleanup(shutil.rmtree, assets)
+        for name in release.NIX_ASSETS.values():
+            (assets / name).write_bytes(name.encode())
+        self.put(release.PINS_FILE, release.pins_json(pins_version, assets))
+        if extra:
+            self.put(*extra)
+        self.commit("release: pin nix binaries for v1.0.1")
+        self.tag_release("v1.0.1")
+        return candidate, assets
+
+    def test_stage_and_final_tags_promote_the_staged_commit_plus_only_the_nix_pins(self):
+        with mock.patch.object(release, "published_preview", return_value=self.preview):
+            candidate, assets = self.stage_and_pin()
+            self.assertEqual(release.check_tag("v1.0.1", "test/repo"), (self.preview, "v1.0.0", "1.0.1", candidate))
+            with self.assertRaisesRegex(ValueError, "staging is closed"):
+                release.check_tag("stage-v1.0.1", "test/repo")
+            self.git("tag", "-d", "v1.0.1")
+            self.assertEqual(release.check_tag("stage-v1.0.1", "test/repo"), (self.preview, "v1.0.0", "1.0.1", candidate))
+        pinned = json.loads(Path(release.PINS_FILE).read_text())
+        digest = base64.b64encode(hashlib.sha256(b"herdr-linux-x86_64").digest()).decode()
+        self.assertEqual(pinned["assets"]["x86_64-linux"], {"name": "herdr-linux-x86_64", "hash": f"sha256-{digest}"})
+        (assets / "herdr-macos-aarch64").write_bytes(b"rebuilt")
+        self.assertNotEqual(release.pins_json("1.0.1", assets), Path(release.PINS_FILE).read_text())
+
+    def test_final_tag_rejects_extra_changes_wrong_pins_or_another_source(self):
+        cases = [
+            ({"extra": ("src/main.rs", "fn main() { /* unstaged */ }\n")}, "only nix/pins.json"),
+            ({"pins_version": "1.0.2"}, "must pin the 1.0.1 assets"),
+        ]
+        for kwargs, pattern in cases:
+            with self.subTest(pattern=pattern):
+                self.git("reset", "-q", "--hard", self.preview)
+                self.stage_and_pin(**kwargs)
+                with mock.patch.object(release, "published_preview", return_value=self.preview):
+                    with self.assertRaisesRegex(ValueError, pattern):
+                        release.check_tag("v1.0.1", "test/repo")
+        self.git("reset", "-q", "--hard", self.preview)
+        self.stage_and_pin()
+        self.tag_release("stage-v1.0.1", self.preview)
+        with self.assertRaisesRegex(ValueError, "sit directly on the commit tagged stage-v1.0.1"):
+            release.check_tag("v1.0.1", "test/repo")
 
 
 if __name__ == "__main__":
