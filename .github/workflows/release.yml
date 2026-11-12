@@ -596,7 +596,7 @@ jobs:
           if [ -s "$RUNNER_TEMP/release-preparation.patch" ]; then
             git apply --3way --index "$RUNNER_TEMP/release-preparation.patch"
           fi
-          python3 scripts/changelog.py sync-latest-json --version "$VERSION" --output distribution/latest.json --announcement "$ANNOUNCEMENT_PATH" --protocol "$RELEASE_PROTOCOL" --endpoint-generation "$RELEASE_ENDPOINT_GENERATION"
+          python3 scripts/changelog.py sync-latest-json --repo "$GITHUB_REPOSITORY" --version "$VERSION" --output distribution/latest.json --announcement "$ANNOUNCEMENT_PATH" --protocol "$RELEASE_PROTOCOL" --endpoint-generation "$RELEASE_ENDPOINT_GENERATION"
           if cmp -s "$ANNOUNCEMENT_ORIGINAL_PATH" docs/next/product-announcement.json; then
             printf 'null\n' > docs/next/product-announcement.json
           else
