@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Fork test release of the binary Nix flake and the build-before-tag release order. Not a real Herdr release.
+
+### Changed
+- The Nix flake installs the release binary.
+
 ## [0.9.5] - 2026-10-14
 
 This is a hotfix release for v0.9.4. See the v0.9.4 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.4
